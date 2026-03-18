@@ -160,6 +160,9 @@ export async function POST(request: NextRequest) {
       backends: body.backends ?? DEFAULT_PARAMS.backends,
       maxContextChunks:
         body.maxContextChunks ?? DEFAULT_PARAMS.maxContextChunks,
+      maxQueryChars: DEFAULT_PARAMS.maxQueryChars,
+      maxContextChars: DEFAULT_PARAMS.maxContextChars,
+      maxChunkChars: DEFAULT_PARAMS.maxChunkChars,
     };
     const dataSource = body.dataSource ?? "inventory";
 

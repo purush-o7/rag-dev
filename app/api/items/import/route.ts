@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getPglite } from "@/lib/db";
 import { parseCSV } from "@/lib/csv";
 import { chunkText, itemToText } from "@/lib/rag/chunk";
+import { cleanText } from "@/lib/rag/clean";
 import { embedTexts } from "@/lib/rag/embed";
 import {
   isPineconeConfigured,
@@ -112,7 +113,7 @@ export async function POST(request: NextRequest) {
 
     if (insertedItems.length > 0) {
       const allChunks = insertedItems.flatMap((item) => {
-        const text = itemToText(item);
+        const text = cleanText(itemToText(item));
         return chunkText(item.id, text);
       });
 

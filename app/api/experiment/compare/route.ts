@@ -3,7 +3,11 @@ import { embedQuery } from "@/lib/rag/embed";
 import { searchPgvector } from "@/lib/rag/search";
 import { searchPinecone, isPineconeConfigured } from "@/lib/rag/pinecone";
 import { generateAnswer } from "@/lib/rag/generate";
-import { checkGuardrails } from "@/lib/rag/guardrails";
+import {
+  checkPreGenerationGuardrails,
+  checkPostGenerationGuardrails,
+} from "@/lib/rag/guardrails";
+import { sanitizeQuery } from "@/lib/rag/sanitize";
 import { getPglite } from "@/lib/db";
 import type {
   BackendResult,
@@ -11,7 +15,7 @@ import type {
   Backend,
   SearchResult,
 } from "@/lib/rag/types";
-import { DEFAULT_PARAMS } from "@/lib/rag/types";
+import { DEFAULT_PARAMS, SAFE_FALLBACK_MESSAGE } from "@/lib/rag/types";
 
 interface CompareRequest {
   question: string;
@@ -24,6 +28,9 @@ interface CompareRequest {
   generateAnswers?: boolean;
   backends?: Backend[];
   maxContextChunks?: number;
+  maxQueryChars?: number;
+  maxContextChars?: number;
+  maxChunkChars?: number;
   dataSource?: "inventory" | "documents";
 }
 
@@ -68,6 +75,8 @@ async function runBackend(
     llmModel: string;
     generateAnswers: boolean;
     maxContextChunks: number;
+    maxContextChars: number;
+    maxChunkChars: number;
     dataSource: "inventory" | "documents";
   }
 ): Promise<BackendResult> {
@@ -106,7 +115,8 @@ async function runBackend(
 
   const searchLatencyMs = Math.round(performance.now() - searchStart);
 
-  const guardrails = checkGuardrails(chunks, {
+  // Pre-generation guardrails (layers 1-3)
+  const preCheck = checkPreGenerationGuardrails(question, chunks, {
     minTopScore: params.similarityThreshold,
   });
 
@@ -119,37 +129,68 @@ async function runBackend(
     (c) => c.score >= params.similarityThreshold
   ).length;
 
-  let answer: string | null = null;
-  let citations: string[] = [];
-  let generationLatencyMs = 0;
-
-  if (params.generateAnswers && guardrails.shouldAnswer) {
-    const genStart = performance.now();
-    const result = await generateAnswer(question, chunks, {
-      model: params.llmModel,
-      temperature: params.temperature,
-      maxTokens: params.maxTokens,
-      maxContextChunks: params.maxContextChunks,
-    });
-    generationLatencyMs = Math.round(performance.now() - genStart);
-    answer = result.answer;
-    citations = result.citations;
+  if (!preCheck.shouldAnswer || !params.generateAnswers) {
+    return {
+      backend,
+      chunks,
+      answer: !preCheck.shouldAnswer ? SAFE_FALLBACK_MESSAGE : null,
+      citations: [],
+      searchLatencyMs,
+      generationLatencyMs: 0,
+      totalLatencyMs: searchLatencyMs,
+      topScore,
+      avgScore,
+      relevantChunks,
+      abstained: !preCheck.shouldAnswer,
+      abstentionLayer: preCheck.layer,
+    };
   }
 
-  const abstained = !guardrails.shouldAnswer;
+  // Generate answer
+  const genStart = performance.now();
+  const generated = await generateAnswer(question, chunks, {
+    model: params.llmModel,
+    temperature: params.temperature,
+    maxTokens: params.maxTokens,
+    maxContextChunks: params.maxContextChunks,
+    maxContextChars: params.maxContextChars,
+    maxChunkChars: params.maxChunkChars,
+  });
+  const generationLatencyMs = Math.round(performance.now() - genStart);
+
+  // Post-generation guardrails (layers 4-5)
+  const validIds = new Set(chunks.slice(0, params.maxContextChunks).map((c) => c.id));
+  const postCheck = checkPostGenerationGuardrails(generated, validIds);
+
+  if (!postCheck.shouldAnswer) {
+    return {
+      backend,
+      chunks,
+      answer: SAFE_FALLBACK_MESSAGE,
+      citations: [],
+      searchLatencyMs,
+      generationLatencyMs,
+      totalLatencyMs: searchLatencyMs + generationLatencyMs,
+      topScore,
+      avgScore,
+      relevantChunks,
+      abstained: true,
+      abstentionLayer: postCheck.layer,
+    };
+  }
 
   return {
     backend,
     chunks,
-    answer,
-    citations,
+    answer: generated.answer,
+    citations: generated.citations,
     searchLatencyMs,
     generationLatencyMs,
     totalLatencyMs: searchLatencyMs + generationLatencyMs,
     topScore,
     avgScore,
     relevantChunks,
-    abstained,
+    abstained: false,
   };
 }
 
@@ -216,19 +257,25 @@ export async function POST(request: NextRequest) {
       backends: body.backends ?? DEFAULT_PARAMS.backends,
       maxContextChunks:
         body.maxContextChunks ?? DEFAULT_PARAMS.maxContextChunks,
+      maxQueryChars: body.maxQueryChars ?? DEFAULT_PARAMS.maxQueryChars,
+      maxContextChars: body.maxContextChars ?? DEFAULT_PARAMS.maxContextChars,
+      maxChunkChars: body.maxChunkChars ?? DEFAULT_PARAMS.maxChunkChars,
     };
     const dataSource = body.dataSource ?? "inventory";
 
     const totalStart = performance.now();
 
+    // Sanitize query
+    const sanitizedQuestion = sanitizeQuery(body.question, params.maxQueryChars);
+
     // Embed query once
     const embedStart = performance.now();
-    const queryEmbedding = await embedQuery(body.question, params.embeddingModel);
+    const queryEmbedding = await embedQuery(sanitizedQuestion, params.embeddingModel);
     const embeddingLatencyMs = Math.round(performance.now() - embedStart);
 
     // Run each backend in parallel
     const backendPromises = params.backends.map((backend) =>
-      runBackend(backend, queryEmbedding, body.question, {
+      runBackend(backend, queryEmbedding, sanitizedQuestion, {
         topK: params.topK,
         similarityThreshold: params.similarityThreshold,
         temperature: params.temperature,
@@ -236,6 +283,8 @@ export async function POST(request: NextRequest) {
         llmModel: params.llmModel,
         generateAnswers: params.generateAnswers,
         maxContextChunks: params.maxContextChunks,
+        maxContextChars: params.maxContextChars,
+        maxChunkChars: params.maxChunkChars,
         dataSource,
       })
     );
@@ -258,7 +307,7 @@ export async function POST(request: NextRequest) {
        VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
       [
         experimentId,
-        body.question,
+        sanitizedQuestion,
         JSON.stringify(params),
         results.pgvector ? JSON.stringify(results.pgvector) : null,
         results.pinecone ? JSON.stringify(results.pinecone) : null,
@@ -267,7 +316,7 @@ export async function POST(request: NextRequest) {
     );
 
     const response = {
-      question: body.question,
+      question: sanitizedQuestion,
       params,
       results,
       comparison,

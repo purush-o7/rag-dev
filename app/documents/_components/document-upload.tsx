@@ -96,6 +96,38 @@ export function DocumentUpload() {
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+
+    // PDF files: send directly via FormData (binary)
+    if (file.name.toLowerCase().endsWith(".pdf")) {
+      setLoading(true);
+      setMessage(null);
+      try {
+        const formData = new FormData();
+        formData.append("file", file);
+        formData.append("name", file.name);
+
+        const res = await fetch("/api/documents/ingest", {
+          method: "POST",
+          body: formData,
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          setMessage({ text: data.error || "Failed to ingest PDF", type: "error" });
+        } else {
+          setMessage({ text: data.message, type: "success" });
+          setName("");
+          setContent("");
+          fetchDocuments();
+        }
+      } catch {
+        setMessage({ text: "Network error", type: "error" });
+      } finally {
+        setLoading(false);
+      }
+      return;
+    }
+
+    // Non-PDF: read as text and show in textarea
     const text = await file.text();
     setName(file.name);
     setContent(text);
@@ -231,7 +263,7 @@ export function DocumentUpload() {
               Upload File
               <input
                 type="file"
-                accept=".txt,.md,.json,.jsonl,.csv"
+                accept=".txt,.md,.json,.jsonl,.csv,.pdf"
                 onChange={handleFileUpload}
                 className="hidden"
               />

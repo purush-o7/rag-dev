@@ -22,18 +22,24 @@ export interface ExperimentParams {
   generateAnswers: boolean;
   backends: Backend[];
   maxContextChunks: number;
+  maxQueryChars: number;
+  maxContextChars: number;
+  maxChunkChars: number;
 }
 
 export const DEFAULT_PARAMS: ExperimentParams = {
   topK: 5,
   similarityThreshold: 0.18,
   temperature: 0.1,
-  maxTokens: 500,
+  maxTokens: 220,
   embeddingModel: "text-embedding-3-small",
   llmModel: "gpt-4.1-nano",
   generateAnswers: true,
   backends: ["pgvector"],
   maxContextChunks: 4,
+  maxQueryChars: 800,
+  maxContextChars: 5500,
+  maxChunkChars: 1400,
 };
 
 // ─── Backend Result ───
@@ -50,6 +56,7 @@ export interface BackendResult {
   avgScore: number;
   relevantChunks: number;
   abstained: boolean;
+  abstentionLayer?: number;
   error?: string;
 }
 
@@ -77,4 +84,8 @@ export interface CompareResponse {
 export interface GuardrailDecision {
   shouldAnswer: boolean;
   reason: string;
+  layer?: number;
 }
+
+export const SAFE_FALLBACK_MESSAGE =
+  "I couldn't find enough relevant information to answer this question confidently.";

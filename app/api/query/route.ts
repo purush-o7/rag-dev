@@ -1,6 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { vectorSearch } from "@/lib/rag/search";
 import { generateAnswer } from "@/lib/rag/generate";
+import { sanitizeQuery } from "@/lib/rag/sanitize";
+import {
+  checkPreGenerationGuardrails,
+  checkPostGenerationGuardrails,
+} from "@/lib/rag/guardrails";
+import { SAFE_FALLBACK_MESSAGE } from "@/lib/rag/types";
 
 export async function POST(request: NextRequest) {
   try {
@@ -21,27 +27,58 @@ export async function POST(request: NextRequest) {
     }
 
     const startTime = Date.now();
+    const sanitized = sanitizeQuery(question);
 
     // Vector search
-    const results = await vectorSearch(question, topK);
+    const results = await vectorSearch(sanitized, topK);
+
+    // Pre-generation guardrails (layers 1-3)
+    const preCheck = checkPreGenerationGuardrails(sanitized, results);
+    if (!preCheck.shouldAnswer) {
+      return NextResponse.json({
+        question: sanitized,
+        answer: SAFE_FALLBACK_MESSAGE,
+        citations: [],
+        chunks: results,
+        latencyMs: Date.now() - startTime,
+        abstained: true,
+        abstentionReason: preCheck.reason,
+      });
+    }
 
     let answer = null;
     let citations: string[] = [];
+    let abstained = false;
+    let abstentionReason: string | undefined;
 
     if (generateResponse && results.length > 0) {
-      const generated = await generateAnswer(question, results);
-      answer = generated.answer;
-      citations = generated.citations;
+      const generated = await generateAnswer(sanitized, results);
+
+      // Post-generation guardrails (layers 4-5)
+      const validIds = new Set(results.map((c) => c.id));
+      const postCheck = checkPostGenerationGuardrails(generated, validIds);
+
+      if (!postCheck.shouldAnswer) {
+        answer = SAFE_FALLBACK_MESSAGE;
+        citations = [];
+        abstained = true;
+        abstentionReason = postCheck.reason;
+      } else {
+        answer = generated.answer;
+        citations = generated.citations;
+      }
     }
 
     const latencyMs = Date.now() - startTime;
 
     return NextResponse.json({
-      question,
+      question: sanitized,
       answer,
       citations,
       chunks: results,
       latencyMs,
+      abstained,
+      abstentionReason,
     });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "Unknown error";
